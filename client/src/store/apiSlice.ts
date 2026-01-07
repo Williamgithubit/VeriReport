@@ -3,7 +3,7 @@ import type { RootState } from './store';
 
 // Define a base query with the base URL
 const baseQuery = fetchBaseQuery({
-  baseUrl: process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001/api',
+  baseUrl: process.env.NEXT_PUBLIC_API_URL || '/api',
   prepareHeaders: (headers, { getState }) => {
     // Get the token from the auth state
     const token = (getState() as RootState).auth.token;

@@ -3,51 +3,61 @@
 import { z } from 'zod';
 import { generateVerificationId } from '@/ai/flows/generate-verification-id';
 import { revalidatePath } from 'next/cache';
-
-// Mock database simulation
-const mockDatabase: { [key: string]: any } = {
-    'a1b2c3d4-e5f6-7890-1234-567890abcdef': {
-        status: 'valid',
-        data: {
-            studentName: 'Alice Johnson',
-            class: '10th Grade',
-            term: 'Fall',
-            year: 2023,
-        }
-    },
-    'b2c3d4e5-f6a7-8901-2345-67890abcdef1': {
-        status: 'pending',
-        data: null
-    },
-     'd4e5f6a7-b8c9-0123-4567-890abcdef123': {
-        status: 'invalid',
-        data: null
-    }
-};
+import { getFirestore, FieldValue } from 'firebase-admin/firestore';
+import { initializeFirebaseAdmin } from '@/lib/firebase/firebase-admin';
+import crypto from 'crypto';
 
 
 export async function verifyReportId(id: string): Promise<{ status: 'valid' | 'invalid' | 'pending'; data: any }> {
-  // Simulate network delay
-  await new Promise(resolve => setTimeout(resolve, 1000));
+  const adminApp = initializeFirebaseAdmin();
+  const db = getFirestore(adminApp);
 
-  const record = mockDatabase[id];
-  if (record) {
-    return { status: record.status, data: record.data };
-  }
-  
-  // To make it more realistic, sometimes return pending for unknown IDs
-  if (Math.random() > 0.9) {
-      return { status: 'pending', data: null };
+  const snap = await db
+    .collection('reports')
+    .where('verificationId', '==', id)
+    .limit(1)
+    .get();
+
+  if (snap.empty) {
+    return { status: 'invalid', data: null };
   }
 
-  return { status: 'invalid', data: null };
+  const report = snap.docs[0].data();
+  const rawStatus = String(report.verificationStatus ?? report.status ?? 'Pending');
+  const normalizedStatus = rawStatus.toLowerCase();
+
+  const status: 'valid' | 'invalid' | 'pending' =
+    normalizedStatus === 'valid'
+      ? 'valid'
+      : normalizedStatus === 'invalid'
+        ? 'invalid'
+        : 'pending';
+
+  if (status !== 'valid') {
+    return { status, data: null };
+  }
+
+  return {
+    status,
+    data: {
+      studentName: report.studentName ?? undefined,
+      class: report.class ?? undefined,
+      status: report.status ?? undefined,
+      year: report.year ?? undefined,
+    },
+  };
 }
 
 const ReportSchema = z.object({
   studentId: z.string().min(1, "Student ID is required."),
   studentName: z.string().min(1, "Student name is required."),
   class: z.string().min(1, "Class is required."),
-  term: z.string().min(1, "Term is required."),
+  status: z.enum([
+    'Passed',
+    'Failed',
+    'Passed Under Condition',
+    'Summer School',
+  ], { required_error: 'Status is required.' }),
   year: z.coerce.number().min(2000, "Invalid year."),
   reportFile: z.any(),
 });
@@ -58,7 +68,7 @@ export async function handleReportUpload(prevState: any, formData: FormData) {
     studentId: formData.get('studentId'),
     studentName: formData.get('studentName'),
     class: formData.get('class'),
-    term: formData.get('term'),
+    status: formData.get('status'),
     year: formData.get('year'),
     reportFile: formData.get('reportFile'),
   });
@@ -70,24 +80,133 @@ export async function handleReportUpload(prevState: any, formData: FormData) {
     };
   }
 
-  const { studentName, class: studentClass, term, year } = validatedFields.data;
+  const { studentId, studentName, class: studentClass, status, year, reportFile } = validatedFields.data;
 
   try {
     // 1. Generate unique verification ID using GenAI flow
     const metadata = JSON.stringify({ ...validatedFields.data, timestamp: new Date().toISOString() });
     const { verificationId } = await generateVerificationId({ reportCardMetadata: metadata });
 
-    // 2. Simulate storing file in Firebase Storage and metadata in Firestore
-    console.log(`Uploading file for ${studentName}...`);
-    console.log(`Storing metadata in Firestore with verification ID: ${verificationId}`);
-    console.log({
-        ...validatedFields.data,
-        verificationId,
-        status: 'pending' // new reports are pending by default
+    const adminApp = initializeFirebaseAdmin();
+    const db = getFirestore(adminApp);
+
+    const cloudName = process.env.CLOUDINARY_CLOUD_NAME;
+    const cloudApiKey = process.env.CLOUDINARY_API_KEY;
+    const cloudApiSecret = process.env.CLOUDINARY_API_SECRET;
+
+    if (!cloudName || !cloudApiKey || !cloudApiSecret) {
+      return {
+        message: 'Missing Cloudinary configuration.',
+        success: false,
+      };
+    }
+
+    const file = reportFile as unknown as File | null;
+    if (!file || typeof (file as any).arrayBuffer !== 'function') {
+      return {
+        message: 'Report file is required.',
+        success: false,
+      };
+    }
+
+    const fileSize = typeof (file as any).size === 'number' ? (file as any).size : 0;
+    const maxSizeBytes = 10 * 1024 * 1024;
+    if (fileSize > maxSizeBytes) {
+      return {
+        message: 'File is too large. Maximum size is 10MB.',
+        success: false,
+      };
+    }
+
+    const mimeType = String((file as any).type || '').toLowerCase();
+    const isPdf = mimeType === 'application/pdf';
+    const isImage = mimeType.startsWith('image/');
+    if (!isPdf && !isImage) {
+      return {
+        message: 'Invalid file type. Please upload a PDF or an image.',
+        success: false,
+      };
+    }
+
+    const safeName = (file.name || 'report').replace(/[^a-zA-Z0-9._-]/g, '_');
+    const timestamp = Math.floor(Date.now() / 1000);
+    const folder = `verireport/reports/${verificationId}`;
+
+    const paramsToSign = {
+      folder,
+      timestamp,
+    };
+
+    const signatureBase = Object.entries(paramsToSign)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([k, v]) => `${k}=${v}`)
+      .join('&');
+
+    const signature = crypto
+      .createHash('sha1')
+      .update(signatureBase + cloudApiSecret)
+      .digest('hex');
+
+    const fileArrayBuffer = await file.arrayBuffer();
+    const blob = new Blob([fileArrayBuffer], { type: file.type || 'application/octet-stream' });
+    const uploadForm = new FormData();
+    uploadForm.append('file', blob, safeName);
+    uploadForm.append('api_key', cloudApiKey);
+    uploadForm.append('timestamp', String(timestamp));
+    uploadForm.append('folder', folder);
+    uploadForm.append('signature', signature);
+
+    const uploadRes = await fetch(`https://api.cloudinary.com/v1_1/${cloudName}/auto/upload`, {
+      method: 'POST',
+      body: uploadForm,
     });
-    
-    // Simulate network delay
-    await new Promise(resolve => setTimeout(resolve, 1500));
+
+    if (!uploadRes.ok) {
+      const errText = await uploadRes.text().catch(() => '');
+      console.error('Cloudinary upload failed:', errText);
+      return {
+        message: 'File upload failed. Please try again.',
+        success: false,
+      };
+    }
+
+    const uploadJson: any = await uploadRes.json();
+    const fileUrl = uploadJson.secure_url as string | undefined;
+    const cloudinaryPublicId = uploadJson.public_id as string | undefined;
+    const cloudinaryResourceType = uploadJson.resource_type as string | undefined;
+
+    if (!fileUrl || !cloudinaryPublicId) {
+      return {
+        message: 'File upload failed. Please try again.',
+        success: false,
+      };
+    }
+
+    // Map status to verification status
+    let verificationStatus: 'Valid' | 'Pending' | 'Invalid';
+    if (status === 'Passed' || status === 'Passed Under Condition') {
+      verificationStatus = 'Valid';
+    } else if (status === 'Failed' || status === 'Summer School') {
+      verificationStatus = 'Invalid';
+    } else {
+      verificationStatus = 'Pending';
+    }
+
+    const docRef = await db.collection('reports').add({
+      studentId,
+      studentName,
+      class: studentClass,
+      year,
+      status,
+      verificationStatus,
+      verificationId,
+      fileUrl,
+      cloudinaryPublicId,
+      cloudinaryResourceType: cloudinaryResourceType ?? 'auto',
+      uploadedFileUrl: fileUrl,
+      createdAt: FieldValue.serverTimestamp(),
+      updatedAt: FieldValue.serverTimestamp(),
+    });
 
     // In a real app, you would revalidate the path of the reports list
     revalidatePath('/dashboard');
@@ -95,6 +214,8 @@ export async function handleReportUpload(prevState: any, formData: FormData) {
     return {
       message: 'Report uploaded successfully!',
       verificationId,
+      reportId: docRef.id,
+      fileUrl,
       success: true,
     };
   } catch (error) {

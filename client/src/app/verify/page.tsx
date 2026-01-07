@@ -19,7 +19,7 @@ type VerificationStatus = 'idle' | 'loading' | 'valid' | 'invalid' | 'pending';
 interface VerificationResult {
   studentName?: string;
   class?: string;
-  term?: string;
+  status?: string;
   year?: number;
 }
 
@@ -56,7 +56,8 @@ export default function VerifyPage() {
               <div className="text-center text-foreground bg-secondary/50 p-4 rounded-lg w-full">
                 <p><strong>Student:</strong> {result.studentName}</p>
                 <p><strong>Class:</strong> {result.class}</p>
-                <p><strong>Period:</strong> {result.term}, {result.year}</p>
+                <p><strong>Status:</strong> {result.status}</p>
+                <p><strong>Year:</strong> {result.year}</p>
               </div>
             )}
           </div>
